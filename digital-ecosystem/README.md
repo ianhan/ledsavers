@@ -1,3 +1,5 @@
+NOTE: This is sakana ai's work, their repo is [here](https://github.com/SakanaAI/digital-ecosystem). I've copied it locally to modify it for a screensaver.
+
 # Digital Ecosystem
 
 An interactive artificial life simulation where neural cellular automata species compete for territory on a 2D grid. Runs entirely in the browser.

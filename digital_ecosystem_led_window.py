@@ -2,6 +2,7 @@
 
 import argparse
 import http.server
+import os
 import shutil
 import subprocess
 import threading
@@ -162,6 +163,14 @@ def build_url(port: int, args: argparse.Namespace) -> str:
 
 
 def build_browser_command(browser: str, url: str, args: argparse.Namespace) -> list[str]:
+    browser_args = list(args.browser_arg)
+    if (
+        os.environ.get("XDG_SESSION_TYPE") == "wayland"
+        and not any(arg.startswith("--ozone-platform=") for arg in browser_args)
+    ):
+        # Native Wayland Chromium ignores absolute window geometry for this use case.
+        browser_args.insert(0, "--ozone-platform=x11")
+
     command = [
         browser,
         f"--app={url}",
@@ -172,7 +181,7 @@ def build_browser_command(browser: str, url: str, args: argparse.Namespace) -> l
         "--disable-features=Translate",
         "--force-device-scale-factor=1",
         "--no-first-run",
-        *args.browser_arg,
+        *browser_args,
     ]
     return command
 

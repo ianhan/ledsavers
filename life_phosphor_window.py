@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 
 import argparse
+import os
 import random
+import select
+import sys
+import termios
+import tty
 
 
 WINDOW_WIDTH = 512
 WINDOW_HEIGHT = 128
 DEFAULT_INTERVAL_MS = 5
 DEFAULT_DECAY_STEP = 1
-DEFAULT_DENSITY = 0.18
+DEFAULT_DENSITY = 0.10
 CHANNEL_RED = 1
 CHANNEL_GREEN = 2
 CHANNEL_BLUE = 4
@@ -191,6 +196,9 @@ class PanelApp:
         self.tk = tk_module
         self.interval_ms = args.interval_ms
         self.off_color = "#000000"
+        self.closed = False
+        self.stdin_fd: int | None = None
+        self.stdin_attrs: list[int] | None = None
         self.world_masks = RGB_WORLD_MASKS if args.rgb else WORLD_MASKS
         self.worlds = [
             (
@@ -227,6 +235,7 @@ class PanelApp:
         self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}+{args.x}+{args.y}")
         self.root.resizable(False, False)
         self.root.configure(bg=self.off_color)
+        self.root.protocol("WM_DELETE_WINDOW", self.quit)
 
         if not args.decorated:
             self.root.overrideredirect(True)
@@ -241,6 +250,7 @@ class PanelApp:
         self.image_label = self.tk.Label(self.root, bd=0, highlightthickness=0, bg=self.off_color)
         self.image_label.pack()
         self.photo = None
+        self._setup_terminal_controls()
 
     def _plane_seed(self, base_seed: int | None, offset: int) -> int | None:
         if base_seed is None:
@@ -264,7 +274,72 @@ class PanelApp:
                 payload.extend((red, green, blue))
         return bytes(payload)
 
+    def _setup_terminal_controls(self) -> None:
+        if not sys.stdin.isatty():
+            return
+        try:
+            self.stdin_fd = sys.stdin.fileno()
+            self.stdin_attrs = termios.tcgetattr(self.stdin_fd)
+            tty.setcbreak(self.stdin_fd)
+        except (OSError, ValueError, termios.error):
+            self.stdin_fd = None
+            self.stdin_attrs = None
+            return
+
+        if hasattr(self.root, "createfilehandler"):
+            self.root.createfilehandler(sys.stdin, self.tk.READABLE, self._handle_terminal_ready)
+        else:
+            self.root.after(self.interval_ms, self._poll_terminal_input)
+
+        print("Terminal controls: q=quit", file=sys.stderr)
+
+    def _restore_terminal_controls(self) -> None:
+        if hasattr(self.root, "deletefilehandler"):
+            try:
+                self.root.deletefilehandler(sys.stdin)
+            except (AttributeError, OSError, ValueError):
+                pass
+
+        if self.stdin_fd is not None and self.stdin_attrs is not None:
+            try:
+                termios.tcsetattr(self.stdin_fd, termios.TCSADRAIN, self.stdin_attrs)
+            except termios.error:
+                pass
+            self.stdin_attrs = None
+
+    def _handle_terminal_ready(self, _file, _mask) -> None:
+        self._drain_terminal_input()
+
+    def _poll_terminal_input(self) -> None:
+        if self.closed:
+            return
+        self._drain_terminal_input()
+        self.root.after(self.interval_ms, self._poll_terminal_input)
+
+    def _drain_terminal_input(self) -> None:
+        if self.stdin_fd is None:
+            return
+
+        while True:
+            ready, _, _ = select.select([self.stdin_fd], [], [], 0)
+            if not ready:
+                return
+
+            try:
+                raw = os.read(self.stdin_fd, 32)
+            except OSError:
+                return
+            if not raw:
+                return
+
+            for char in raw.decode(errors="ignore"):
+                if char.lower() == "q":
+                    self.quit()
+                    return
+
     def render_frame(self) -> None:
+        if self.closed:
+            return
         for world_mask, worm in self.worms:
             worm.step(self.worlds, self.world_by_mask[world_mask])
         frames = [world.next_frame() for _, world in self.worlds]
@@ -275,6 +350,10 @@ class PanelApp:
         self.root.after(self.interval_ms, self.render_frame)
 
     def quit(self, _event=None) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self._restore_terminal_controls()
         self.root.destroy()
 
     def run(self) -> None:

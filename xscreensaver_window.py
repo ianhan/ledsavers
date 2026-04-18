@@ -77,11 +77,15 @@ def iter_search_dirs() -> list[Path]:
     return dirs
 
 
+def is_screensaver_hack_name(name: str) -> bool:
+    return not name.startswith("xscreensaver-")
+
+
 def list_hack_entries() -> list[tuple[str, str]]:
     hack_paths: dict[str, str] = {}
     for directory in iter_search_dirs():
         for entry in directory.iterdir():
-            if entry.is_file() and os.access(entry, os.X_OK):
+            if entry.is_file() and os.access(entry, os.X_OK) and is_screensaver_hack_name(entry.name):
                 hack_paths.setdefault(entry.name, str(entry))
     return sorted(hack_paths.items())
 
@@ -128,11 +132,15 @@ def resolve_hack(hack: str) -> str:
     if os.sep in hack or hack.startswith("."):
         candidate = Path(hack).expanduser()
         if candidate.is_file() and os.access(candidate, os.X_OK):
+            if not is_screensaver_hack_name(candidate.name):
+                raise SystemExit(f"'{candidate.name}' is an xscreensaver helper, not a screensaver hack")
             return str(candidate)
         raise SystemExit(f"hack not found or not executable: {hack}")
 
     direct = shutil.which(hack)
     if direct:
+        if not is_screensaver_hack_name(Path(direct).name):
+            raise SystemExit(f"'{Path(direct).name}' is an xscreensaver helper, not a screensaver hack")
         return direct
 
     for name, path in list_hack_entries():
