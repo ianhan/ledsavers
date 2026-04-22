@@ -411,6 +411,7 @@ class FluerePanelApp:
         self.satori_blocks: list[tuple[int, int, int]] = []
         self.satori_block_cursor = 0
         self.closed = False
+        self.scene_locked = False
         self.stdin_fd: int | None = None
         self.stdin_attrs: list[int] | None = None
 
@@ -427,8 +428,10 @@ class FluerePanelApp:
             self.root.attributes("-topmost", True)
 
         self.root.bind("<Escape>", self.quit)
+        self.root.bind("m", self.new_map)
         self.root.bind("n", self.next_scene)
         self.root.bind("p", self.next_palette)
+        self.root.bind("l", self.toggle_scene_lock)
         self.root.bind("q", self.quit)
 
         self.image_label = self.tk.Label(self.root, bd=0, highlightthickness=0, bg="black")
@@ -488,7 +491,7 @@ class FluerePanelApp:
             stripes=self.args.stripes if self.args.stripes is not None else bool(self.rng.randrange(2)),
         )
 
-    def new_scene(self) -> None:
+    def _build_scene_image(self) -> None:
         style1 = self._choose_style(self.fixed_style1)
         style2 = self._choose_style(self.fixed_style2)
         drawing = FluereDrawing(
@@ -505,6 +508,9 @@ class FluerePanelApp:
         else:
             self.satori_drawing = None
             self.image_data = bytearray(drawing.fill_pixels())
+
+    def new_scene(self) -> None:
+        self._build_scene_image()
         self.color_table = self._build_color_table(prefer_new_palette=False)
         self.palette_offset = 0
         self.frame_counter = 0
@@ -588,7 +594,7 @@ class FluerePanelApp:
         else:
             self.root.after(self.args.interval_ms, self._poll_terminal_input)
 
-        print("Terminal controls: n=next scene, p=next palette, q=quit", file=sys.stderr)
+        print("Terminal controls: l=toggle lock, m=new map, n=next scene, p=next palette, q=quit", file=sys.stderr)
 
     def _restore_terminal_controls(self) -> None:
         if hasattr(self.root, "deletefilehandler"):
@@ -630,13 +636,27 @@ class FluerePanelApp:
                 return
 
             for char in raw.decode(errors="ignore"):
-                if char.lower() == "n":
-                    self.new_scene()
-                elif char.lower() == "p":
-                    self.next_palette()
-                elif char.lower() == "q":
-                    self.quit()
+                if self._handle_command_char(char):
                     return
+
+    def _handle_command_char(self, char: str) -> bool:
+        lowered = char.lower()
+        if lowered == "l":
+            self.toggle_scene_lock()
+            return False
+        if lowered == "m":
+            self.new_map()
+            return False
+        if lowered == "n":
+            self.next_scene()
+            return False
+        if lowered == "p":
+            self.next_palette()
+            return False
+        if lowered == "q":
+            self.quit()
+            return True
+        return False
 
     def render_frame(self) -> None:
         if self.closed:
@@ -652,18 +672,28 @@ class FluerePanelApp:
         self.image_label.configure(image=self.photo)
 
         self.palette_offset = (self.palette_offset + PALETTE_CYCLE_STEP) % PALETTE_SIZE
-        self.frame_counter += 1
-        if self.frame_counter >= self.frames_per_image:
-            self.new_scene()
+        if not self.scene_locked:
+            self.frame_counter += 1
+            if self.frame_counter >= self.frames_per_image:
+                self.new_scene()
 
         self.root.after(self.args.interval_ms, self.render_frame)
 
     def next_scene(self, _event=None) -> None:
         self.new_scene()
 
+    def new_map(self, _event=None) -> None:
+        self._build_scene_image()
+        self.frame_counter = 0
+
     def next_palette(self, _event=None) -> None:
         self.color_table = self._build_color_table(prefer_new_palette=True)
         self.palette_offset = 0
+
+    def toggle_scene_lock(self, _event=None) -> None:
+        self.scene_locked = not self.scene_locked
+        state = "locked" if self.scene_locked else "unlocked"
+        print(f"Scene lock {state}", file=sys.stderr)
 
     def quit(self, _event=None) -> None:
         if self.closed:

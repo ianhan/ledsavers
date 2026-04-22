@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
 
 import argparse
+import math
 import os
 import random
 import select
 import sys
 import termios
 import tty
+
+from fluere_led_window import (
+    DEFAULT_IMAGE_DURATION_MS,
+    DEFAULT_NUM_KNOTS,
+    PALETTE_CYCLE_STEP,
+    PALETTE_SIZE,
+    STYLE_NAMES,
+    FluereDrawing,
+    get_color_table,
+    load_palettes,
+)
 
 
 WINDOW_WIDTH = 512
@@ -123,56 +135,44 @@ class PhosphorLife:
 
 
 class Snake:
-    DIRECTIONS = (
-        (1, 0),
-        (-1, 0),
-        (0, 1),
-        (0, -1),
-        (1, 1),
-        (1, -1),
-        (-1, 1),
-        (-1, -1),
-    )
+    SPEED = 1.0
+    STRAIGHT_CHANCE = 0.65
+    MAX_TURN_RADIANS = math.pi / 3
 
     def __init__(self, width: int, height: int, seed: int | None) -> None:
         self.width = width
         self.height = height
         self.random = random.Random(seed)
-        self.position = (0, 0)
-        self.direction = self.random.choice(self.DIRECTIONS)
+        self.position = (0.0, 0.0)
+        self.heading = self.random.uniform(0.0, math.tau)
         self._respawn()
 
     def _respawn(self) -> None:
         x = self.random.randrange(self.width)
         y = self.random.randrange(self.height)
-        self.position = (x, y)
-        self.direction = self.random.choice(self.DIRECTIONS)
+        self.position = (x + 0.5, y + 0.5)
+        self.heading = self.random.uniform(0.0, math.tau)
 
-    def _choose_move(self) -> tuple[int, int, int, int]:
+    def _cell_position(self) -> tuple[int, int]:
+        x, y = self.position
+        return int(x) % self.width, int(y) % self.height
+
+    def _choose_move(self) -> tuple[float, float, int, int]:
         head_x, head_y = self.position
-        directions = list(self.DIRECTIONS)
-        self.random.shuffle(directions)
-
-        if self.direction in directions:
-            directions.remove(self.direction)
-            directions.insert(0, self.direction)
-
-        if directions[0] == self.direction and self.random.random() < 0.65:
-            dx, dy = directions[0]
-        else:
-            dx, dy = self.random.choice(directions)
-        nx = (head_x + dx) % self.width
-        ny = (head_y + dy) % self.height
-        return dx, dy, nx, ny
+        if self.random.random() >= self.STRAIGHT_CHANCE:
+            self.heading = (
+                self.heading + self.random.uniform(-self.MAX_TURN_RADIANS, self.MAX_TURN_RADIANS)
+            ) % math.tau
+        next_x = (head_x + math.cos(self.heading) * self.SPEED) % self.width
+        next_y = (head_y + math.sin(self.heading) * self.SPEED) % self.height
+        return next_x, next_y, int(next_x) % self.width, int(next_y) % self.height
 
     def step(
         self,
         worlds: list[tuple[int, PhosphorLife]],
         own_world: PhosphorLife,
     ) -> None:
-        move = self._choose_move()
-        dx, dy, next_x, next_y = move
-        self.direction = (dx, dy)
+        next_pos_x, next_pos_y, next_x, next_y = self._choose_move()
 
         foreign_worlds = [
             world
@@ -184,10 +184,10 @@ class Snake:
                 world.clear_cell(next_x, next_y, clear_brightness=True)
             own_world.seed_cell(next_x, next_y)
 
-        self.position = (next_x, next_y)
+        self.position = (next_pos_x, next_pos_y)
 
     def draw(self, own_world: PhosphorLife) -> None:
-        x, y = self.position
+        x, y = self._cell_position()
         own_world.write_pixel(x, y)
 
 
@@ -196,10 +196,13 @@ class PanelApp:
         self.tk = tk_module
         self.interval_ms = args.interval_ms
         self.off_color = "#000000"
+        self.random = random.Random(args.seed)
+        self.fluere_enabled = args.fluere
         self.closed = False
         self.stdin_fd: int | None = None
         self.stdin_attrs: list[int] | None = None
         self.world_masks = RGB_WORLD_MASKS if args.rgb else WORLD_MASKS
+        self.palettes = load_palettes(None)
         self.worlds = [
             (
                 mask,
@@ -217,6 +220,18 @@ class PanelApp:
             mask: world
             for mask, world in self.worlds
         }
+        self.world_color_tables: list[bytes] = []
+        self.world_palette_offsets: list[int] = []
+        self.world_palette_steps: list[int] = []
+        self._randomize_world_palettes()
+        self.fluere_image_data = b""
+        self.fluere_color_table = b""
+        self.fluere_palette_offset = 0
+        self.fluere_palette_step = PALETTE_CYCLE_STEP
+        self.fluere_frame_counter = 0
+        self.fluere_frames_per_scene = max(1, DEFAULT_IMAGE_DURATION_MS // max(1, self.interval_ms))
+        if self.fluere_enabled:
+            self._new_fluere_scene()
         self.worms = [
             (
                 world_mask,
@@ -243,9 +258,14 @@ class PanelApp:
             self.root.attributes("-topmost", True)
 
         self.root.bind("<Escape>", self.quit)
+        self.root.bind("p", self.next_palette)
         self.root.bind("q", self.quit)
 
         self.ppm_header = f"P6 {WINDOW_WIDTH} {WINDOW_HEIGHT} 255\n".encode("ascii")
+        self.pixel_count = WINDOW_WIDTH * WINDOW_HEIGHT
+        self.ppm_buffer = bytearray(len(self.ppm_header) + self.pixel_count * 3)
+        self.ppm_buffer[: len(self.ppm_header)] = self.ppm_header
+        self.rgb_buffer = memoryview(self.ppm_buffer)[len(self.ppm_header) :]
 
         self.image_label = self.tk.Label(self.root, bd=0, highlightthickness=0, bg=self.off_color)
         self.image_label.pack()
@@ -257,22 +277,125 @@ class PanelApp:
             return None
         return base_seed + offset
 
+    def _build_color_table(self, stripes: bool) -> tuple[bytes, int, int]:
+        palette_rng = random.Random(self.random.randrange(1 << 30))
+        palette = self.palettes[self.random.randrange(len(self.palettes))]
+        color_table = get_color_table(
+            palette=palette,
+            rng=palette_rng,
+            randomize=bool(palette_rng.randrange(2)),
+            stripes=stripes,
+        )
+        palette_offset = palette_rng.randrange(PALETTE_SIZE)
+        cycle_step = 1 + palette_rng.randrange(3)
+        if not palette_rng.randrange(2):
+            cycle_step *= -1
+        return color_table, palette_offset, cycle_step
+
+    def _randomize_world_palettes(self) -> None:
+        self.world_color_tables.clear()
+        self.world_palette_offsets.clear()
+        self.world_palette_steps.clear()
+
+        for _ in self.world_masks:
+            color_table, palette_offset, cycle_step = self._build_color_table(stripes=False)
+            self.world_color_tables.append(color_table)
+            self.world_palette_offsets.append(palette_offset)
+            self.world_palette_steps.append(cycle_step)
+
+    def _choose_fluere_style(self) -> int:
+        return self.random.randrange(len(STYLE_NAMES))
+
+    def _build_fluere_image(self) -> bytes:
+        drawing = FluereDrawing(
+            width=WINDOW_WIDTH,
+            height=WINDOW_HEIGHT,
+            num_knots=DEFAULT_NUM_KNOTS,
+            style1=self._choose_fluere_style(),
+            style2=self._choose_fluere_style(),
+            checkerboard=True,
+            rng=random.Random(self.random.randrange(1 << 30)),
+        )
+        return drawing.fill_pixels()
+
+    def _randomize_fluere_palette(self) -> None:
+        self.fluere_color_table, self.fluere_palette_offset, _ = self._build_color_table(
+            stripes=bool(self.random.randrange(2))
+        )
+        self.fluere_palette_step = PALETTE_CYCLE_STEP
+
+    def _new_fluere_scene(self) -> None:
+        self.fluere_image_data = self._build_fluere_image()
+        self._randomize_fluere_palette()
+        self.fluere_frame_counter = 0
+
+    def _current_world_channel_tables(self) -> list[tuple[bytearray, bytearray, bytearray]]:
+        channel_tables: list[tuple[bytearray, bytearray, bytearray]] = []
+        for color_table, palette_offset in zip(self.world_color_tables, self.world_palette_offsets):
+            red_table = bytearray(PALETTE_SIZE)
+            green_table = bytearray(PALETTE_SIZE)
+            blue_table = bytearray(PALETTE_SIZE)
+            for level in range(1, PALETTE_SIZE):
+                base = (palette_offset + (PALETTE_SIZE - 1 - level)) * 3
+                red_table[level] = color_table[base] * level // 255
+                green_table[level] = color_table[base + 1] * level // 255
+                blue_table[level] = color_table[base + 2] * level // 255
+            channel_tables.append((red_table, green_table, blue_table))
+        return channel_tables
+
+    def _current_fluere_channel_tables(self) -> tuple[bytes, bytes, bytes]:
+        start = self.fluere_palette_offset * 3
+        stop = (self.fluere_palette_offset + PALETTE_SIZE) * 3
+        segment = self.fluere_color_table[start:stop]
+        return bytes(segment[0::3]), bytes(segment[1::3]), bytes(segment[2::3])
+
+    def _advance_fluere(self) -> None:
+        if not self.fluere_enabled:
+            return
+
+        self.fluere_palette_offset = (self.fluere_palette_offset + self.fluere_palette_step) % PALETTE_SIZE
+        self.fluere_frame_counter += 1
+        if self.fluere_frame_counter >= self.fluere_frames_per_scene:
+            self._new_fluere_scene()
+
     def _frame_to_ppm(self, frames: list[list[bytearray]]) -> bytes:
-        payload = bytearray(self.ppm_header)
+        channel_tables = self._current_world_channel_tables()
+        if self.fluere_enabled:
+            fluere_red_table, fluere_green_table, fluere_blue_table = self._current_fluere_channel_tables()
+        else:
+            fluere_red_table = None
+            fluere_green_table = None
+            fluere_blue_table = None
+        pixel_offset = 0
+        pixel_index = 0
+
         for rows in zip(*frames):
-            for levels in zip(*rows):
+            row_tables = tuple(zip(rows, channel_tables))
+            for x in range(WINDOW_WIDTH):
                 red = 0
                 green = 0
                 blue = 0
-                for level, mask in zip(levels, self.world_masks):
-                    if mask & CHANNEL_RED and level > red:
-                        red = level
-                    if mask & CHANNEL_GREEN and level > green:
-                        green = level
-                    if mask & CHANNEL_BLUE and level > blue:
-                        blue = level
-                payload.extend((red, green, blue))
-        return bytes(payload)
+                has_life = False
+                for row, (red_table, green_table, blue_table) in row_tables:
+                    level = row[x]
+                    if not level:
+                        continue
+                    has_life = True
+                    red = 255 - ((255 - red) * (255 - red_table[level]) // 255)
+                    green = 255 - ((255 - green) * (255 - green_table[level]) // 255)
+                    blue = 255 - ((255 - blue) * (255 - blue_table[level]) // 255)
+                if not has_life and fluere_red_table is not None:
+                    level = self.fluere_image_data[pixel_index]
+                    red = fluere_red_table[level]
+                    green = fluere_green_table[level]
+                    blue = fluere_blue_table[level]
+                self.rgb_buffer[pixel_offset] = red
+                self.rgb_buffer[pixel_offset + 1] = green
+                self.rgb_buffer[pixel_offset + 2] = blue
+                pixel_offset += 3
+                pixel_index += 1
+
+        return bytes(self.ppm_buffer)
 
     def _setup_terminal_controls(self) -> None:
         if not sys.stdin.isatty():
@@ -291,7 +414,7 @@ class PanelApp:
         else:
             self.root.after(self.interval_ms, self._poll_terminal_input)
 
-        print("Terminal controls: q=quit", file=sys.stderr)
+        print("Terminal controls: p=next palette, q=quit", file=sys.stderr)
 
     def _restore_terminal_controls(self) -> None:
         if hasattr(self.root, "deletefilehandler"):
@@ -333,7 +456,10 @@ class PanelApp:
                 return
 
             for char in raw.decode(errors="ignore"):
-                if char.lower() == "q":
+                lowered = char.lower()
+                if lowered == "p":
+                    self.next_palette()
+                elif lowered == "q":
                     self.quit()
                     return
 
@@ -347,7 +473,15 @@ class PanelApp:
             worm.draw(self.world_by_mask[world_mask])
         self.photo = self.tk.PhotoImage(data=self._frame_to_ppm(frames), format="PPM")
         self.image_label.configure(image=self.photo)
+        for index, cycle_step in enumerate(self.world_palette_steps):
+            self.world_palette_offsets[index] = (self.world_palette_offsets[index] + cycle_step) % PALETTE_SIZE
+        self._advance_fluere()
         self.root.after(self.interval_ms, self.render_frame)
+
+    def next_palette(self, _event=None) -> None:
+        self._randomize_world_palettes()
+        if self.fluere_enabled:
+            self._randomize_fluere_palette()
 
     def quit(self, _event=None) -> None:
         if self.closed:
@@ -363,7 +497,7 @@ class PanelApp:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Display additive RGB Life worlds with phosphor decay and four random worms per active color.",
+        description="Display Life worlds with phosphor decay, Fluere palettes, and four random worms per active world.",
     )
     parser.add_argument("--x", type=int, default=2823, help="Window X position in pixels.")
     parser.add_argument("--y", type=int, default=268, help="Window Y position in pixels.")
@@ -397,8 +531,13 @@ def parse_args() -> argparse.Namespace:
         help="Use only the red, green, and blue Life worlds.",
     )
     parser.add_argument(
+        "--fluere",
+        action="store_true",
+        help="Render a separate Fluere animation behind pixels where all Life worlds are dark.",
+    )
+    parser.add_argument(
         "--title",
-        default="Conway Life Additive Worms",
+        default="Conway Life Palette Worms",
         help="Window title when decorations are enabled.",
     )
     parser.add_argument(
