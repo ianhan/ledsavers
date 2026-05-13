@@ -9,7 +9,7 @@ import sys
 import termios
 import tty
 
-from fluere_led_window import (
+from fluere import (
     DEFAULT_IMAGE_DURATION_MS,
     DEFAULT_NUM_KNOTS,
     PALETTE_CYCLE_STEP,
