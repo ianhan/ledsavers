@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+from collections import deque
 import os
 import random
 import select
@@ -13,6 +14,7 @@ from pathlib import Path
 WINDOW_WIDTH = 512
 WINDOW_HEIGHT = 128
 DEFAULT_INTERVAL_MS = 100
+DEFAULT_RECENT_IMAGE_COOLDOWN = 25
 DEFAULT_IMAGE_DIR = Path(__file__).resolve().parent / "astro"
 IMAGE_EXTENSIONS = {
     ".bmp",
@@ -47,7 +49,9 @@ class PanelApp:
         self.off_color = "#000000"
         self.random = random.Random(args.seed)
         self.image_paths = image_paths
-        self.current_image_path: Path | None = None
+        self.recent_image_paths: deque[Path] = deque(
+            maxlen=min(DEFAULT_RECENT_IMAGE_COOLDOWN, max(0, len(image_paths) - 1))
+        )
         self.closed = False
         self.stdin_fd: int | None = None
         self.stdin_attrs: list[int] | None = None
@@ -168,10 +172,15 @@ class PanelApp:
                     self.random_image()
 
     def _choose_random_path(self) -> Path:
-        if len(self.image_paths) == 1 or self.current_image_path is None:
-            return self.random.choice(self.image_paths)
+        if len(self.image_paths) == 1:
+            return self.image_paths[0]
 
-        choices = [path for path in self.image_paths if path != self.current_image_path]
+        if not self.recent_image_paths:
+            choices = self.image_paths
+        else:
+            recent_paths = set(self.recent_image_paths)
+            choices = [path for path in self.image_paths if path not in recent_paths]
+
         return self.random.choice(choices)
 
     def random_image(self, _event=None) -> None:
@@ -179,7 +188,7 @@ class PanelApp:
             return
 
         image_path = self._choose_random_path()
-        self.current_image_path = image_path
+        self.recent_image_paths.append(image_path)
         self.photo = self.tk.PhotoImage(data=self._load_panel_ppm(image_path), format="PPM")
         self.image_label.configure(image=self.photo)
         self.root.title(f"Bowling: {image_path.name}")
