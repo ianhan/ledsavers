@@ -43,6 +43,7 @@ class PanelApp:
     def __init__(self, tk_module, args: argparse.Namespace, image_paths: list[Path]) -> None:
         self.tk = tk_module
         self.interval_ms = args.interval_ms
+        self.scale = args.scale
         self.off_color = "#000000"
         self.random = random.Random(args.seed)
         self.image_paths = image_paths
@@ -77,6 +78,12 @@ class PanelApp:
         from PIL import Image
 
         source = source_image.convert("RGB")
+        if self.scale != 100:
+            resampling = getattr(Image, "Resampling", Image)
+            scaled_width = max(1, round(source.width * self.scale / 100))
+            scaled_height = max(1, round(source.height * self.scale / 100))
+            source = source.resize((scaled_width, scaled_height), resample=resampling.LANCZOS)
+
         panel = Image.new("RGB", (WINDOW_WIDTH, WINDOW_HEIGHT))
         source_width, source_height = source.size
 
@@ -209,6 +216,12 @@ def parse_args() -> argparse.Namespace:
         help="Directory of images to display. Default: astro next to this script.",
     )
     parser.add_argument(
+        "--scale",
+        type=float,
+        default=100.0,
+        help="Resize each source image to this percentage before tiling it across the panel.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -229,7 +242,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Request that the window stays above other windows.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.scale <= 0:
+        raise SystemExit("--scale must be greater than 0")
+
+    return args
 
 
 def main() -> None:
